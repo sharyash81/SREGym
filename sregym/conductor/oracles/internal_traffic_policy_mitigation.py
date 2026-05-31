@@ -21,6 +21,8 @@ from sregym.conductor.oracles.base import Oracle
 
 
 class InternalTrafficPolicyMitigationOracle(Oracle):
+    importance = 1.0
+
     def __init__(self, problem):
         super().__init__(problem)
         self.core_v1 = client.CoreV1Api()

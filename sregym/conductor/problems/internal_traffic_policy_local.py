@@ -31,13 +31,18 @@ local ``recommendation`` pod will fail silently.
    a. Select two worker nodes: *pod_node* and *victim_node*.
    b. Pin the ``recommendation`` Deployment to *pod_node* via ``nodeSelector``
       so the single replica is guaranteed to run there.
-   c. Patch the ``recommendation`` Service:
+   c. Pin the ``frontend`` (caller) Deployment to *victim_node* so the single
+      caller replica is guaranteed to land on a node with no local
+      ``recommendation`` pod.  Both are single-replica Deployments, so without
+      this the scheduler could co-locate them and the fault would produce zero
+      observable symptoms.
+   d. Patch the ``recommendation`` Service:
       ``spec.internalTrafficPolicy: Local``.
 
 2. ``recover_fault``
    a. Restore ``spec.internalTrafficPolicy: Cluster`` on the Service.
-   b. Remove the ``nodeSelector`` from the Deployment so the pod may
-      reschedule freely.
+   b. Remove the ``nodeSelector`` from both the ``recommendation`` and
+      ``frontend`` Deployments so the pods may reschedule freely.
 
 Valid agent mitigations (all accepted by the oracle)
 -----------------------------------------------------
@@ -71,6 +76,9 @@ class InternalTrafficPolicyLocalAstronomyShop(Problem):
     FAULTY_SERVICE = "recommendation"
     SERVICE_PORT = 8080
     POD_LABEL_SELECTOR = "app.kubernetes.io/component=recommendation"
+
+    CALLER_SERVICE = "frontend"
+    CALLER_POD_LABEL_SELECTOR = "app.kubernetes.io/component=frontend"
 
     def __init__(self):
         self.app = AstronomyShop()
@@ -128,11 +136,11 @@ class InternalTrafficPolicyLocalAstronomyShop(Problem):
             raise RuntimeError("internal_traffic_policy_local_astronomy_shop requires at least two worker nodes")
         return workers[0], workers[1]  # (pod_node, victim_node)
 
-    def _nodes_with_running_pod(self) -> set[str]:
-        """Return the set of nodes that currently have a Running recommendation pod."""
+    def _nodes_with_running_pod(self, label_selector: str | None = None) -> set[str]:
+        """Return the set of nodes that currently have a Running pod for the given selector."""
         pods = self.core_v1.list_namespaced_pod(
             self.namespace,
-            label_selector=self.POD_LABEL_SELECTOR,
+            label_selector=label_selector or self.POD_LABEL_SELECTOR,
         )
         return {pod.spec.node_name for pod in pods.items if pod.status.phase == "Running" and pod.spec.node_name}
 
@@ -140,18 +148,18 @@ class InternalTrafficPolicyLocalAstronomyShop(Problem):
     # Deployment / service helpers
     # ------------------------------------------------------------------
 
-    def _pin_deployment_to_node(self, node: str) -> None:
+    def _pin_deployment_to_node(self, deployment: str, node: str) -> None:
         self.apps_v1.patch_namespaced_deployment(
-            self.FAULTY_SERVICE,
+            deployment,
             self.namespace,
             {"spec": {"template": {"spec": {"nodeSelector": {"kubernetes.io/hostname": node}}}}},
         )
 
-    def _clear_deployment_node_selector(self) -> None:
+    def _clear_deployment_node_selector(self, deployment: str) -> None:
         self.apps_v1.patch_namespaced_deployment(
-            self.FAULTY_SERVICE,
+            deployment,
             self.namespace,
-            {"spec": {"template": {"spec": {"nodeSelector": {}}}}},
+            {"spec": {"template": {"spec": {"nodeSelector": None}}}},
         )
 
     def _set_internal_traffic_policy(self, policy: str) -> None:
@@ -161,13 +169,14 @@ class InternalTrafficPolicyLocalAstronomyShop(Problem):
             {"spec": {"internalTrafficPolicy": policy}},
         )
 
-    def _wait_for_pod_on_node(self, target_node: str, timeout: int = 180) -> None:
+    def _wait_for_pod_on_node(self, target_node: str, label_selector: str | None = None, timeout: int = 180) -> None:
+        label_selector = label_selector or self.POD_LABEL_SELECTOR
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if target_node in self._nodes_with_running_pod():
+            if target_node in self._nodes_with_running_pod(label_selector):
                 return
             time.sleep(4)
-        raise RuntimeError(f"{self.FAULTY_SERVICE} pod did not reach {target_node} within {timeout}s")
+        raise RuntimeError(f"pod ({label_selector}) did not reach {target_node} within {timeout}s")
 
     # ------------------------------------------------------------------
     # Fault injection / recovery
@@ -180,10 +189,14 @@ class InternalTrafficPolicyLocalAstronomyShop(Problem):
         self.pod_node, self.victim_node = self._select_nodes()
         print(f"Pod node: {self.pod_node} | Victim node: {self.victim_node}")
 
-        self._pin_deployment_to_node(self.pod_node)
+        self._pin_deployment_to_node(self.FAULTY_SERVICE, self.pod_node)
         self.kubectl.exec_command(f"kubectl rollout restart deployment/{self.FAULTY_SERVICE} -n {self.namespace}")
         self._wait_for_pod_on_node(self.pod_node)
         print(f"{self.FAULTY_SERVICE} pod is Running on {self.pod_node}")
+        self._pin_deployment_to_node(self.CALLER_SERVICE, self.victim_node)
+        self.kubectl.exec_command(f"kubectl rollout restart deployment/{self.CALLER_SERVICE} -n {self.namespace}")
+        self._wait_for_pod_on_node(self.victim_node, self.CALLER_POD_LABEL_SELECTOR)
+        print(f"{self.CALLER_SERVICE} pod is Running on {self.victim_node}")
 
         self._set_internal_traffic_policy("Local")
         print(
@@ -201,10 +214,11 @@ class InternalTrafficPolicyLocalAstronomyShop(Problem):
             self._set_internal_traffic_policy("Cluster")
             print(f"Restored service/{self.FAULTY_SERVICE}: internalTrafficPolicy=Cluster")
 
-        with contextlib.suppress(ApiException, Exception):
-            self._clear_deployment_node_selector()
-            self.kubectl.exec_command(f"kubectl rollout restart deployment/{self.FAULTY_SERVICE} -n {self.namespace}")
-            print(f"Cleared nodeSelector on deployment/{self.FAULTY_SERVICE}")
+        for deployment in (self.FAULTY_SERVICE, self.CALLER_SERVICE):
+            with contextlib.suppress(ApiException, Exception):
+                self._clear_deployment_node_selector(deployment)
+                self.kubectl.exec_command(f"kubectl rollout restart deployment/{deployment} -n {self.namespace}")
+                print(f"Cleared nodeSelector on deployment/{deployment}")
 
         with contextlib.suppress(Exception):
             self.kubectl.wait_for_ready(self.namespace, max_wait=180)
